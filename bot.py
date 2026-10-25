@@ -1,0 +1,266 @@
+"""
+Bot de alertas de vermelhos (futebol) para um grupo do Telegram — fonte: FlashScore.
+
+Abre a página "AO VIVO" da FlashScore num browser headless (Playwright/Chromium),
+mantém-na aberta (a FlashScore atualiza os resultados sozinha) e lê a página a cada
+CHECK_SECONDS. Quando aparece um novo ícone de cartão vermelho num jogo, envia um
+alerta para o grupo com o resultado e a situação numérica (ex.: 10 vs 11).
+
+Variáveis de ambiente:
+  TELEGRAM_TOKEN     token do bot (@BotFather)                        (obrigatória)
+  TELEGRAM_CHAT_ID   id do grupo (negativo, ex.: -1001234567890)       (obrigatória)
+  CHECK_SECONDS      intervalo entre leituras da página (omissão 20)
+  RELOAD_MINUTES     recarregar a página de X em X minutos (omissão 20)
+  LEAGUE_FILTER      palavras separadas por vírgula; só alerta ligas cujo nome
+                     contenha uma delas (ex.: "portugal,inglaterra,espanha"). Vazio = todas
+  DEBUG_DUMP         "1" para escrever nos logs o HTML de alguns jogos (afinar seletores)
+  FLASHSCORE_URL     omissão https://www.flashscore.pt/
+"""
+
+import asyncio
+import html
+import logging
+import os
+import time
+
+import httpx
+from playwright.async_api import async_playwright
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("vermelhos")
+
+TG_TOKEN = os.environ["TELEGRAM_TOKEN"]
+CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+URL = os.getenv("FLASHSCORE_URL", "https://www.flashscore.pt/")
+CHECK_SECONDS = int(os.getenv("CHECK_SECONDS", "15"))
+RELOAD_MINUTES = int(os.getenv("RELOAD_MINUTES", "20"))
+LEAGUE_FILTER = [x.strip().lower() for x in os.getenv("LEAGUE_FILTER", "").split(",") if x.strip()]
+DEBUG_DUMP = os.getenv("DEBUG_DUMP") == "1"
+FORGET_AFTER = 45 * 60  # esquece jogos que não aparecem há 45 min
+
+TG = f"https://api.telegram.org/bot{TG_TOKEN}"
+UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+)
+
+# Lê todos os jogos visíveis. Os seletores têm alternativas porque a FlashScore
+# muda de classes de tempos a tempos; se deixar de funcionar, é aqui que se mexe.
+EXTRACT_JS = r"""
+(debug) => {
+  const RED = '[class*="redCard"], [class*="red-card"], [data-testid*="redCard"]';
+  const txt = el => el ? el.innerText.replace(/\s+/g, ' ').trim() : '';
+  const q = (root, sels) => { for (const s of sels) { const e = root.querySelector(s); if (e) return e; } return null; };
+
+  const countReds = c => {
+    if (!c) return 0;
+    let n = 0;
+    c.querySelectorAll(RED).forEach(e => {
+      const anc = e.parentElement && e.parentElement.closest(RED);
+      if (anc && c.contains(anc)) return;           // evita contar o mesmo ícone duas vezes
+      const m = (e.getAttribute('class') || '').match(/redCard-?(\d)/i);
+      n += m ? parseInt(m[1]) : 1;                   // alguns ícones trazem o número (2 vermelhos)
+    });
+    return n;
+  };
+
+  const out = [], samples = [];
+  let league = '';
+  const nodes = document.querySelectorAll(
+    '.event__header, [class*="wclLeagueHeader"], [class*="headerLeague"], .event__match'
+  );
+  nodes.forEach(el => {
+    if (!el.classList.contains('event__match')) {
+      if (el.closest('.event__match')) return;
+      // ignora elementos internos de um cabeçalho já tratado
+      if (el.parentElement && el.parentElement.closest('.event__header, [class*="wclLeagueHeader"], [class*="headerLeague"]')) return;
+      const cat = q(el, ['.event__title--type', '[class*="headerLeague__category"]']);
+      const name = q(el, ['.event__title--name', '[class*="headerLeague__title"]']);
+      const t = (cat || name) ? [txt(cat), txt(name)].filter(Boolean).join(': ') : txt(el).slice(0, 80);
+      if (t) league = t;
+      return;
+    }
+    const home = q(el, ['.event__homeParticipant', '.event__participant--home', '[class*="participant--home"]']);
+    const away = q(el, ['.event__awayParticipant', '.event__participant--away', '[class*="participant--away"]']);
+    const link = el.querySelector('a[href*="/jogo/"], a.eventRowLink');
+    out.push({
+      id: el.id || (link ? link.getAttribute('href') : txt(home) + '-' + txt(away)),
+      league,
+      home: txt(home),
+      away: txt(away),
+      hs: txt(q(el, ['.event__score--home', '[class*="score--home"]'])),
+      as: txt(q(el, ['.event__score--away', '[class*="score--away"]'])),
+      minute: txt(q(el, ['.event__stage--block', '.event__stage', '[class*="event__stage"]'])),
+      hr: countReds(home),
+      ar: countReds(away),
+      href: link ? link.href : '',
+    });
+    if (debug && samples.length < 3) samples.push(el.outerHTML.slice(0, 3000));
+  });
+  return { matches: out, samples };
+}
+"""
+
+
+async def open_live(page) -> None:
+    await page.goto(URL, wait_until="domcontentloaded", timeout=60_000)
+    # Banner de cookies: recusa os não essenciais
+    try:
+        await page.locator("#onetrust-reject-all-handler").click(timeout=5_000)
+    except Exception:
+        pass
+    # Separador "AO VIVO"
+    for sel in ['.filters__tab:has-text("AO VIVO")', '[class*="filters"] >> text=AO VIVO', "text=AO VIVO"]:
+        try:
+            await page.locator(sel).first.click(timeout=5_000)
+            break
+        except Exception:
+            continue
+    else:
+        log.warning("Não encontrei o separador AO VIVO — vou ler a página principal")
+    try:
+        await page.wait_for_selector(".event__match", timeout=15_000)
+    except Exception:
+        log.info("Sem jogos visíveis neste momento")
+
+
+def build_message(m: dict, team_side: str, hr: int, ar: int, cancelled: bool = False) -> str:
+    e = html.escape
+    team = m["home"] if team_side == "home" else m["away"]
+    hp, ap = 11 - hr, 11 - ar
+    if hp < ap:
+        situ = f"⚠️ <b>{e(m['home'])}</b> joga com {hp} contra {ap}"
+    elif ap < hp:
+        situ = f"⚠️ <b>{e(m['away'])}</b> joga com {ap} contra {hp}"
+    else:
+        situ = f"⚖️ Igualdade numérica ({hp} vs {ap})"
+    minute = f" ({e(m['minute'])})" if m["minute"] else ""
+    link = f'\n🔗 <a href="{e(m["href"])}">Ver jogo</a>' if m["href"] else ""
+    title = (
+        f"↩️ <b>VERMELHO ANULADO</b> (VAR) a {e(team)}{minute}"
+        if cancelled
+        else f"🟥 <b>VERMELHO</b> para {e(team)}{minute}"
+    )
+    return (
+        f"{title}\n"
+        f"🏆 {e(m['league'])}\n"
+        f"⚽ {e(m['home'])} {e(m['hs'] or '?')}-{e(m['as'] or '?')} {e(m['away'])}\n"
+        f"{situ}{link}"
+    )
+
+
+async def send(client: httpx.AsyncClient, text: str) -> None:
+    try:
+        r = await client.post(
+            f"{TG}/sendMessage",
+            json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True},
+        )
+        if r.status_code != 200:
+            log.error("Falha no envio para o Telegram: %s", r.text)
+    except Exception:
+        log.exception("Erro ao enviar para o Telegram")
+
+
+async def block_heavy(route) -> None:
+    # Não descarrega imagens/vídeo/fontes: poupa memória e tráfego (os ícones são SVG no HTML)
+    if route.request.resource_type in ("image", "media", "font"):
+        await route.abort()
+    else:
+        await route.continue_()
+
+
+def process_match(m: dict, state: dict, lower: dict, first_cycle: bool) -> list[str]:
+    """Compara a leitura atual de um jogo com o que já se sabia e devolve as mensagens a enviar."""
+    mid = m["id"]
+    seen_now = [m["hr"], m["ar"]]
+    if first_cycle or mid not in state:
+        # Jogo novo (ou arranque do bot): regista sem alertar,
+        # exceto se o jogo surgiu depois do arranque já com vermelhos
+        state[mid] = list(seen_now)
+        lower[mid] = [0, 0]
+        if first_cycle or seen_now == [0, 0]:
+            return []
+        counts = [0, 0]
+    else:
+        counts = state[mid]
+
+    msgs = []
+    for i, side in enumerate(("home", "away")):
+        # Subiu: um alerta por cada vermelho novo (mesmo que saiam 2 na mesma leitura),
+        # com a contagem passo a passo (ex.: 10v10 -> 9v10)
+        while seen_now[i] > counts[i]:
+            counts[i] += 1
+            msgs.append(build_message(m, side, counts[0], counts[1]))
+        # Desceu (VAR anulou): só confirma após 2 leituras seguidas,
+        # para não confundir com um ícone que "pisca" na página
+        if seen_now[i] < counts[i]:
+            lower[mid][i] += 1
+            if lower[mid][i] >= 2:
+                counts[i] = seen_now[i]
+                msgs.append(build_message(m, side, counts[0], counts[1], cancelled=True))
+                lower[mid][i] = 0
+        else:
+            lower[mid][i] = 0
+    state[mid] = counts
+    return msgs
+
+
+async def main() -> None:
+    state: dict[str, list[int]] = {}  # id do jogo -> [vermelhos casa, vermelhos fora]
+    lower: dict[str, list[int]] = {}  # leituras seguidas com menos vermelhos (VAR)
+    last_seen: dict[str, float] = {}
+    first_cycle = True  # no arranque não alerta vermelhos que já existiam
+
+    async with async_playwright() as p, httpx.AsyncClient(timeout=20) as client:
+        browser = await p.chromium.launch(args=["--no-sandbox", "--disable-dev-shm-usage"])
+        ctx = await browser.new_context(user_agent=UA, locale="pt-PT", viewport={"width": 1280, "height": 2000})
+        await ctx.route("**/*", block_heavy)
+        page = await ctx.new_page()
+        await open_live(page)
+        last_reload = time.monotonic()
+        log.info("Bot iniciado (leitura a cada %ss, filtro: %s)", CHECK_SECONDS, LEAGUE_FILTER or "todas")
+
+        while True:
+            try:
+                if time.monotonic() - last_reload > RELOAD_MINUTES * 60:
+                    await open_live(page)
+                    last_reload = time.monotonic()
+
+                data = await page.evaluate(EXTRACT_JS, DEBUG_DUMP)
+                matches = data["matches"]
+                if DEBUG_DUMP:
+                    log.info("Jogos lidos: %d | exemplo: %s", len(matches), matches[:3])
+                    for s in data["samples"]:
+                        log.info("HTML de exemplo: %s", s)
+
+                now = time.monotonic()
+                for m in matches:
+                    if LEAGUE_FILTER and not any(f in m["league"].lower() for f in LEAGUE_FILTER):
+                        continue
+                    last_seen[m["id"]] = now
+                    for msg in process_match(m, state, lower, first_cycle):
+                        log.info("Alerta: %s", msg.replace("\n", " | "))
+                        await send(client, msg)
+
+                for mid in [k for k, t in last_seen.items() if now - t > FORGET_AFTER]:
+                    last_seen.pop(mid, None)
+                    state.pop(mid, None)
+                    lower.pop(mid, None)
+                first_cycle = False
+            except Exception:
+                log.exception("Erro no ciclo — a reabrir a página")
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+                try:
+                    page = await ctx.new_page()
+                    await open_live(page)
+                    last_reload = time.monotonic()
+                except Exception:
+                    log.exception("Falhou a reabertura; tento no próximo ciclo")
+            await asyncio.sleep(CHECK_SECONDS)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

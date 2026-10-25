@@ -1,0 +1,16 @@
+app = "vermelhos-alertas"
+primary_region = "mad"
+
+[build]
+
+[env]
+  CHECK_SECONDS = "15"
+  RELOAD_MINUTES = "20"
+  # LEAGUE_FILTER = "portugal,inglaterra,espanha,itália,alemanha,frança,europa"
+  # DEBUG_DUMP = "1"
+
+# Sem [http_service]: é um worker que corre sempre.
+# O Chromium precisa de ~1 GB de RAM.
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "1gb"
