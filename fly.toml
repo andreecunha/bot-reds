@@ -1,16 +1,25 @@
-app = "vermelhos-alertas"
-primary_region = "mad"
+# fly.toml app configuration file generated for vermelhos-alertas on 2026-10-26T00:05:52Z
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'vermelhos-alertas'
+primary_region = 'ams'
 
 [build]
 
 [env]
-  CHECK_SECONDS = "15"
-  RELOAD_MINUTES = "20"
-  # LEAGUE_FILTER = "portugal,inglaterra,espanha,itália,alemanha,frança,europa"
-  # DEBUG_DUMP = "1"
+  CHECK_SECONDS = '15'
+  RELOAD_MINUTES = '20'
 
-# Sem [http_service]: é um worker que corre sempre.
-# O Chromium precisa de ~1 GB de RAM.
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = 'stop'
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ['app']
+
 [[vm]]
-  size = "shared-cpu-1x"
-  memory = "1gb"
+  size = 'shared-cpu-1x'
+  memory = '1gb'
