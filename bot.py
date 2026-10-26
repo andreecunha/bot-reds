@@ -48,7 +48,10 @@ UA = (
 # muda de classes de tempos a tempos; se deixar de funcionar, é aqui que se mexe.
 EXTRACT_JS = r"""
 (debug) => {
-  const RED = '[class*="redCard"], [class*="red-card"], [data-testid*="redCard"]';
+  // Ícone de vermelho: várias formas possíveis (classe, data-testid, título), sem distinguir maiúsculas
+  const RED = ['class', 'data-testid', 'title', 'aria-label', 'href', 'xlink:href']
+    .flatMap(a => ['redcard', 'red-card', 'red_card', 'cartão vermelho', 'cartao vermelho']
+      .map(k => `[${a.replace(':', '\\:')}*="${k}" i]`)).join(', ');
   const txt = el => el ? el.innerText.replace(/\s+/g, ' ').trim() : '';
   const q = (root, sels) => { for (const s of sels) { const e = root.querySelector(s); if (e) return e; } return null; };
 
@@ -58,7 +61,7 @@ EXTRACT_JS = r"""
     c.querySelectorAll(RED).forEach(e => {
       const anc = e.parentElement && e.parentElement.closest(RED);
       if (anc && c.contains(anc)) return;           // evita contar o mesmo ícone duas vezes
-      const m = (e.getAttribute('class') || '').match(/redCard-?(\d)/i);
+      const m = ['class', 'data-testid', 'href', 'xlink:href'].map(a => e.getAttribute(a) || '').join(' ').match(/red-?_?card-?_?(\d)/i);
       n += m ? parseInt(m[1]) : 1;                   // alguns ícones trazem o número (2 vermelhos)
     });
     return n;
@@ -76,18 +79,28 @@ EXTRACT_JS = r"""
       if (el.parentElement && el.parentElement.closest('.event__header, [class*="wclLeagueHeader"], [class*="headerLeague"]')) return;
       const cat = q(el, ['.event__title--type', '[class*="headerLeague__category"]']);
       const name = q(el, ['.event__title--name', '[class*="headerLeague__title"]']);
-      const t = (cat || name) ? [txt(cat), txt(name)].filter(Boolean).join(': ') : txt(el).slice(0, 80);
+      let t;
+      if (cat || name) {
+        const c = txt(cat).replace(/:+$/, '').trim();
+        let n = txt(name);
+        if (c) n = n.split(c).join('').replace(/^[:\s]+|[:\s]+$/g, '').trim();  // tira o país repetido
+        t = [c, n].filter(Boolean).join(': ');
+      } else {
+        t = txt(el).slice(0, 80);
+      }
       if (t) league = t;
       return;
     }
     const home = q(el, ['.event__homeParticipant', '.event__participant--home', '[class*="participant--home"]']);
     const away = q(el, ['.event__awayParticipant', '.event__participant--away', '[class*="participant--away"]']);
     const link = el.querySelector('a[href*="/jogo/"], a.eventRowLink');
+    // nome da equipa sem textos temporários como "GOLO"
+    const nameOf = c => c ? txt(q(c, ['[class*="wcl-name"]', '[data-testid="wcl-simple-text-01"]', '[class*="participant__participantName"]']) || c) : '';
     out.push({
       id: el.id || (link ? link.getAttribute('href') : txt(home) + '-' + txt(away)),
       league,
-      home: txt(home),
-      away: txt(away),
+      home: nameOf(home),
+      away: nameOf(away),
       hs: txt(q(el, ['.event__score--home', '[class*="score--home"]'])),
       as: txt(q(el, ['.event__score--away', '[class*="score--away"]'])),
       minute: txt(q(el, ['.event__stage--block', '.event__stage', '[class*="event__stage"]'])),
@@ -95,9 +108,14 @@ EXTRACT_JS = r"""
       ar: countReds(away),
       href: link ? link.href : '',
     });
-    if (debug && samples.length < 3) samples.push(el.outerHTML.slice(0, 3000));
+    // no diagnóstico, mostra primeiro jogos que tenham algo com "card" (para confirmar o ícone do vermelho)
+    if (debug) {
+      const h = el.outerHTML;
+      if (/card/i.test(h)) samples.unshift(h.slice(0, 4000));
+      else if (samples.length < 2) samples.push(h.slice(0, 1500));
+    }
   });
-  return { matches: out, samples };
+  return { matches: out, samples: samples.slice(0, 3) };
 }
 """
 
