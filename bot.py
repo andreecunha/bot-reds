@@ -28,6 +28,9 @@ from playwright.async_api import async_playwright
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("vermelhos")
+# não registar cada pedido HTTP (o endereço do Telegram contém o token)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 TG_TOKEN = os.environ["TELEGRAM_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
@@ -184,11 +187,11 @@ def build_message(m: dict, team_side: str, hr: int, ar: int, cancelled: bool = F
     )
 
 
-async def send(client: httpx.AsyncClient, text: str) -> None:
+async def send(client: httpx.AsyncClient, text: str, chat_id=None) -> None:
     try:
         r = await client.post(
             f"{TG}/sendMessage",
-            json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True},
+            json={"chat_id": chat_id or CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True},
         )
         if r.status_code != 200:
             log.error("Falha no envio para o Telegram: %s", r.text)
@@ -256,8 +259,83 @@ async def health_server() -> None:
         await server.serve_forever()
 
 
+def fmt_duration(sec: float) -> str:
+    sec = int(sec)
+    d, rem = divmod(sec, 86400)
+    h, rem = divmod(rem, 3600)
+    m, s_ = divmod(rem, 60)
+    if d:
+        return f"{d} d {h} h"
+    if h:
+        return f"{h} h {m} min"
+    if m:
+        return f"{m} min"
+    return f"{s_} s"
+
+
+def status_text(st: dict) -> str:
+    now = time.time()
+    last_ok = st.get("last_ok")
+    if last_ok and now - last_ok < max(120, CHECK_SECONDS * 6):
+        head = "🟢 <b>Bot online</b>"
+        read = f"🔄 Última leitura: há {fmt_duration(now - last_ok)}"
+    elif last_ok:
+        head = "🟠 <b>Bot ligado, mas com problemas a ler a FlashScore</b>"
+        read = f"🔄 Última leitura bem-sucedida: há {fmt_duration(now - last_ok)}"
+    else:
+        head = "🟡 <b>Bot a arrancar…</b>"
+        read = "🔄 Ainda sem leituras"
+    jogos = (
+        f"⚽ A acompanhar {st['matches']} jogos ao vivo em {st['leagues']} ligas"
+        if st["matches"] else "⚽ Sem jogos ao vivo neste momento"
+    )
+    return (
+        f"{head}\n"
+        f"⏱️ Ligado há {fmt_duration(now - st['start'])}\n"
+        f"{jogos}\n"
+        f"{read}\n"
+        f"🟥 Alertas enviados desde que arrancou: {st['alerts']}"
+    )
+
+
+async def commands_loop(client: httpx.AsyncClient, st: dict) -> None:
+    """Responde a /estado (e /status, /start) no Telegram."""
+    try:
+        await client.post(f"{TG}/setMyCommands", json={"commands": [
+            {"command": "estado", "description": "Ver se o bot está online e quantos jogos acompanha"},
+        ]})
+        # ignora mensagens antigas (enviadas antes de o bot arrancar)
+        r = await client.get(f"{TG}/getUpdates", params={"offset": -1, "timeout": 0})
+        res = r.json().get("result", [])
+        offset = res[-1]["update_id"] + 1 if res else None
+    except Exception:
+        log.exception("Falha a preparar os comandos")
+        offset = None
+
+    while True:
+        try:
+            params = {"timeout": 25, "allowed_updates": '["message"]'}
+            if offset:
+                params["offset"] = offset
+            r = await client.get(f"{TG}/getUpdates", params=params, timeout=35)
+            for u in r.json().get("result", []):
+                offset = u["update_id"] + 1
+                msg = u.get("message") or {}
+                cmd = (msg.get("text") or "").strip().split()[0:1]
+                cmd = cmd[0].split("@")[0].lower() if cmd else ""
+                if cmd in ("/estado", "/status", "/start"):
+                    await send(client, status_text(st), chat_id=msg["chat"]["id"])
+        except Exception:
+            log.exception("Erro a ler comandos do Telegram")
+            await asyncio.sleep(5)
+
+
 async def main() -> None:
     asyncio.create_task(health_server())
+    st = {"start": time.time(), "matches": 0, "leagues": 0, "last_ok": None, "alerts": 0}
+    errors_in_row = 0
+    warned = False
+    announced = False
     state: dict[str, list[int]] = {}  # id do jogo -> [vermelhos casa, vermelhos fora]
     lower: dict[str, list[int]] = {}  # leituras seguidas com menos vermelhos (VAR)
     last_seen: dict[str, float] = {}
@@ -272,6 +350,7 @@ async def main() -> None:
         last_reload = time.monotonic()
         last_count_log = 0.0
         log.info("Bot iniciado (leitura a cada %ss, filtro: %s)", CHECK_SECONDS, LEAGUE_FILTER or "todas")
+        asyncio.create_task(commands_loop(client, st))
 
         while True:
             try:
@@ -286,6 +365,19 @@ async def main() -> None:
 
                 data = await page.evaluate(EXTRACT_JS, DEBUG_DUMP)
                 matches = data["matches"]
+                st["matches"] = len(matches)
+                st["leagues"] = len({m["league"] for m in matches})
+                st["last_ok"] = time.time()
+                if not announced:
+                    await send(client, "🟢 <b>Bot online</b> — vou avisar aqui sempre que houver um vermelho.\n"
+                               + (f"⚽ A acompanhar {st['matches']} jogos ao vivo em {st['leagues']} ligas"
+                                  if st["matches"] else "⚽ Sem jogos ao vivo neste momento")
+                               + "\nEscreve /estado para confirmar a qualquer momento.")
+                    announced = True
+                if warned:
+                    await send(client, "✅ Voltei a ler a FlashScore normalmente.")
+                    warned = False
+                errors_in_row = 0
                 if time.monotonic() - last_count_log > 600 or first_cycle:
                     leagues = len({m["league"] for m in matches})
                     log.info("A acompanhar %d jogos ao vivo em %d ligas", len(matches), leagues)
@@ -303,6 +395,7 @@ async def main() -> None:
                     for msg in process_match(m, state, lower, first_cycle):
                         log.info("Alerta: %s", msg.replace("\n", " | "))
                         await send(client, msg)
+                        st["alerts"] += 1
 
                 for mid in [k for k, t in last_seen.items() if now - t > FORGET_AFTER]:
                     last_seen.pop(mid, None)
@@ -311,6 +404,12 @@ async def main() -> None:
                 first_cycle = False
             except Exception:
                 log.exception("Erro no ciclo — a reabrir a página")
+                errors_in_row += 1
+                # ~5 falhas seguidas (≈1–2 min): avisa o grupo uma vez
+                if errors_in_row >= 5 and not warned:
+                    await send(client, "⚠️ Estou com problemas a ler a FlashScore. "
+                                       "Os alertas podem falhar até eu recuperar — aviso quando voltar ao normal.")
+                    warned = True
                 try:
                     await page.close()
                 except Exception:
