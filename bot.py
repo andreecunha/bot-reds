@@ -120,6 +120,23 @@ EXTRACT_JS = r"""
 """
 
 
+# Abre ligas recolhidas na lista (só botões dentro de cabeçalhos de liga marcados como fechados)
+EXPAND_JS = r"""
+() => {
+  const sel = [
+    '.event__header [aria-expanded="false"]',
+    '[class*="wclLeagueHeader"] [aria-expanded="false"]',
+    '[class*="headerLeague"] [aria-expanded="false"]',
+    '.event__expander--close',
+    '[class*="wclLeagueHeader"][aria-expanded="false"]',
+  ].join(', ');
+  let n = 0;
+  document.querySelectorAll(sel).forEach(b => { try { b.click(); n++; } catch (e) {} });
+  return n;
+}
+"""
+
+
 async def open_live(page) -> None:
     await page.goto(URL, wait_until="domcontentloaded", timeout=60_000)
     # Banner de cookies: recusa os não essenciais
@@ -253,6 +270,7 @@ async def main() -> None:
         page = await ctx.new_page()
         await open_live(page)
         last_reload = time.monotonic()
+        last_count_log = 0.0
         log.info("Bot iniciado (leitura a cada %ss, filtro: %s)", CHECK_SECONDS, LEAGUE_FILTER or "todas")
 
         while True:
@@ -261,8 +279,17 @@ async def main() -> None:
                     await open_live(page)
                     last_reload = time.monotonic()
 
+                opened = await page.evaluate(EXPAND_JS)
+                if opened:
+                    log.info("Abri %d liga(s) recolhida(s)", opened)
+                    await asyncio.sleep(2)
+
                 data = await page.evaluate(EXTRACT_JS, DEBUG_DUMP)
                 matches = data["matches"]
+                if time.monotonic() - last_count_log > 600 or first_cycle:
+                    leagues = len({m["league"] for m in matches})
+                    log.info("A acompanhar %d jogos ao vivo em %d ligas", len(matches), leagues)
+                    last_count_log = time.monotonic()
                 if DEBUG_DUMP:
                     log.info("Jogos lidos: %d | exemplo: %s", len(matches), matches[:3])
                     for s in data["samples"]:
