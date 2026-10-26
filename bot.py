@@ -205,7 +205,24 @@ def process_match(m: dict, state: dict, lower: dict, first_cycle: bool) -> list[
     return msgs
 
 
+async def health_server() -> None:
+    """Responde 'ok' na porta 8080 para os health checks do Fly.io (o bot não tem site)."""
+    async def handle(reader, writer):
+        try:
+            await reader.read(1024)
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            await writer.drain()
+        finally:
+            writer.close()
+
+    server = await asyncio.start_server(handle, "0.0.0.0", int(os.getenv("PORT", "8080")))
+    log.info("Health check a responder na porta %s", os.getenv("PORT", "8080"))
+    async with server:
+        await server.serve_forever()
+
+
 async def main() -> None:
+    asyncio.create_task(health_server())
     state: dict[str, list[int]] = {}  # id do jogo -> [vermelhos casa, vermelhos fora]
     lower: dict[str, list[int]] = {}  # leituras seguidas com menos vermelhos (VAR)
     last_seen: dict[str, float] = {}

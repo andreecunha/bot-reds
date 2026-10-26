@@ -26,7 +26,7 @@ Com `DEBUG_DUMP=1`, os logs mostram quantos jogos o bot leu e os vermelhos de ca
 
 ## 3. Alojar no Fly.io
 ```bash
-fly launch --no-deploy --copy-config --name vermelhos-alertas
+fly launch --no-deploy --copy-config --name bot-reds
 fly secrets set TELEGRAM_TOKEN=... TELEGRAM_CHAT_ID=-100...
 fly deploy
 fly scale count 1
